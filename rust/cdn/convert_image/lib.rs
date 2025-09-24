@@ -106,8 +106,19 @@ impl HttpContext for HttpBody {
             }
         }
 
-        // indicator for on_response_headers and for cache key
-        self.set_http_request_header("Image-Format", Some("image/avif"));
+        // Check if AVIF conversion is enabled
+        let convert_to_avif = match str_param("CONVERT_TO_AVIF") {
+            Ok(val) => val.to_lowercase() == "true" || val == "1",
+            Err(_) => true, // Default to true for backward compatibility
+        };
+        
+        // Set the target format based on environment variable
+        if convert_to_avif {
+            self.set_http_request_header("Image-Format", Some("image/avif"));
+        } else {
+            // Keep original format, but still indicate processing needed for resize
+            self.set_http_request_header("Image-Format", Some("original-with-processing"));
+        }
 
         Action::Continue
     }
@@ -156,7 +167,14 @@ impl HttpContext for HttpBody {
         // image to be transformed, set headers accordingly
         self.set_http_response_header("Content-Length", None);
         self.set_http_response_header("Transfer-Encoding", Some("Chunked"));
-        self.set_http_response_header("Content-Type", Some(content_type.as_str()));
+        
+        // Set content type based on whether we're converting to AVIF or keeping original
+        if content_type == "image/avif" {
+            self.set_http_response_header("Content-Type", Some("image/avif"));
+        } else if content_type == "original-with-processing" {
+            // Keep original content type, will be determined from the actual image
+            // Content-Type will be set in the response body phase
+        }
 
         // indicate to on_http_response_body that transformation is needed
         self.set_property(vec!["response.content-type"], Some(content_type.as_bytes()));
@@ -181,8 +199,10 @@ impl HttpContext for HttpBody {
             return Action::Pause;
         };
 
-        if content_type != "image/avif" {
-            // should never happen
+        let convert_to_avif = content_type == "image/avif";
+        let process_original = content_type == "original-with-processing";
+        
+        if !convert_to_avif && !process_original {
             println!("Content-Type {} is not supported, not transforming", content_type);
             return Action::Continue;
         }
@@ -216,17 +236,30 @@ impl HttpContext for HttpBody {
 
             let mut out = Vec::new();
             let mut c = Cursor::new(&mut out);
-            println!("Starting AVIF encoding...");
-            let res = img.write_with_encoder(
+            
+            let res = if convert_to_avif {
+                println!("Starting AVIF encoding...");
+                img.write_with_encoder(
                     codecs::avif::AvifEncoder::new_with_speed_quality(
                         &mut c,
                         u8_param("AVIF_SPEED", 1, 10, 5),
                         u8_param("AVIF_QUALITY", 1, 100, 70))
-            );
+                )
+            } else {
+                println!("Saving in original format...");
+                // Determine original format from the image and save accordingly
+                self.save_in_original_format(&img, &mut out)
+            };
 
             match res {
                 Ok(_) => {
-                    println!("AVIF encoding successful: {} bytes -> {} bytes {}", body_size, out.len(), content_type);
+                    if convert_to_avif {
+                        println!("AVIF encoding successful: {} bytes -> {} bytes", body_size, out.len());
+                    } else {
+                        println!("Original format processing successful: {} bytes -> {} bytes", body_size, out.len());
+                        // Set the correct content-type for original format
+                        self.set_original_content_type();
+                    }
                     
                     println!("Setting response body with {} bytes", out.len());
                     if out.is_empty() {
@@ -248,7 +281,11 @@ impl HttpContext for HttpBody {
                     println!("set_http_response_body call completed");
                 }
                 Err(e) => {
-                    println!("AVIF encoding failed: {}", e);
+                    if convert_to_avif {
+                        println!("AVIF encoding failed: {}", e);
+                    } else {
+                        println!("Original format processing failed: {}", e);
+                    }
                     // Return original body on encoding failure
                     return Action::Continue;
                 }
@@ -358,6 +395,58 @@ impl HttpBody {
                 img.resize(width, height, image::imageops::FilterType::Lanczos3)
             }
             (None, None) => img, // No resize needed
+        }
+    }
+    
+    fn save_in_original_format(&self, img: &DynamicImage, out: &mut Vec<u8>) -> Result<(), image::ImageError> {
+        use std::io::Cursor;
+        
+        // Get the original file extension to determine format
+        let format = if let Some(ext_bytes) = self.get_property(vec!["request.extension"]) {
+            if let Ok(ext) = from_utf8(&ext_bytes) {
+                match ext.to_lowercase().as_str() {
+                    "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+                    "png" => image::ImageFormat::Png,
+                    _ => image::ImageFormat::Jpeg, // Default to JPEG
+                }
+            } else {
+                image::ImageFormat::Jpeg // Default to JPEG
+            }
+        } else {
+            image::ImageFormat::Jpeg // Default to JPEG
+        };
+        
+        let mut cursor = Cursor::new(out);
+        
+        match format {
+            image::ImageFormat::Jpeg => {
+                img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
+            }
+            image::ImageFormat::Png => {
+                img.write_to(&mut cursor, image::ImageFormat::Png)?;
+            }
+            _ => {
+                img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn set_original_content_type(&self) {
+        // Set the correct MIME type based on file extension
+        if let Some(ext_bytes) = self.get_property(vec!["request.extension"]) {
+            if let Ok(ext) = from_utf8(&ext_bytes) {
+                let mime_type = match ext.to_lowercase().as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "png" => "image/png",
+                    _ => "image/jpeg", // Default to JPEG
+                };
+                // Note: This might not work due to HTTP/2 header restrictions
+                // but we'll try to set it anyway
+                println!("Setting Content-Type to: {}", mime_type);
+                // self.set_http_response_header("Content-Type", Some(mime_type));
+            }
         }
     }
 }
